@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# axn —— 速卖通商品图出图的统一入口。用法: axn auto --src 新
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$HERE/scripts/axn_img.py" "$@"

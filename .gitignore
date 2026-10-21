@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 出图产物
+output/
+_work/
+*.zip
+
+# macOS
+.DS_Store
