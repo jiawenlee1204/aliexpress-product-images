@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""速卖通商品图批量出图 —— 通用 CLI（图生图：/v1/images/edits，可带多张参考图）。
+"""速卖通商品图批量出图：图生图（POST {base}/images/edits）+ 产品印字叠印。
 
-子命令:
-  scan    <来货目录>                          列出 SKU / 品类 / Excel 里的方位需求，并打印 specs 模板
-  render  --specs specs.json --src <来货根>    按 specs 出候选（默认 A/B 两版）
-  pick    --sku SKU --cand A                  把候选定稿拷到 output/，旧图进 _work/replaced/
-  clean                                       把 output/ 里除成品图以外的东西挪到 _work/
+配置（环境变量，或当前/上层目录的 .axn.json）：
+  AXN_API_BASE     OpenAI 兼容端点，默认 https://token.sensenova.cn/v1
+  AXN_API_KEY      API Key（.axn.json 里可用 api_key_env 指定读哪个环境变量）
+  AXN_IMAGE_MODEL  生图模型，必须是支持图生图/图像编辑的模型（接收 images 输入）
+  AXN_VLM_MODEL    看图模型，仅 spec/auto 起草提示词时需要；不配就手写 specs.json
+  AXN_SIZE         输出尺寸，默认 2048x2048
+.axn.json 键名：api_base / image_model / vlm_model / size / api_key_env
 
-目录约定（项目根）:
-  output/                只有成品 <SKU>.jpg
-  _work/candidates/      候选 <SKU>_<候选>.jpg
-  _work/replaced/        被替换的旧成品
-  _work/specs.json       每个 SKU 的提示词规格（由 agent 看图后撰写）
-  来货/<品类>图片方位需求/<SKU>/<SKU>产品图.* <SKU>效果图.*  + <品类>产品方位需求.xlsx
+子命令：
+  scan   <来货目录>                     列 SKU 与 Excel 机位要求
+  spec   --src <目录>                   看图模型起草六段提示词到 _work/specs.json
+  render --specs <json> --src <目录>    按规格出候选（--dry-run 只看计划）
+  auto   --src <目录> [--review]        起草（缺规格时）→ 出图 → 复核 → 定稿
+  pick   --sku <SKU> --cand <A|B>       候选定稿到 output/
+  overlay --base <图> --out <图> --text "COMFORT|INSOLE"   叠印产品印字
+  clean                                 把 output/ 里的过程目录挪进 _work/
 
-specs.json 结构:
-{
-  "skus": {
-    "SK0020603": {
-      "A": {"identity": "...", "camera": "...", "adapt": "...", "allow": "...", "forbid": "...", "tail": "..."},
-      "B": {...}
-    }
-  }
-}
-可选键 refs: ["某图.jpg", ...]（额外参考图，路径相对该 SKU 的产品图目录）。
+项目目录约定：
+  output/            成品 <SKU>.jpg
+  _work/candidates/  候选 <SKU>_<候选>.jpg
+  _work/replaced/    被替换的旧成品
+  _work/specs.json   每个 SKU 的提示词规格
+
+specs.json 结构：{"skus": {"SKU": {"A": {"identity": "...", "camera": "...", "adapt": "...",
+"allow": "...", "forbid": "...", "tail": "..."}}}}
+可选键：refs（额外参考图，相对该 SKU 目录）、overlay（出图后自动叠印的参数）。
 """
 import argparse, base64, json, math, os, re, shutil, sys, time, urllib.error, urllib.request
 import xml.etree.ElementTree as ET
@@ -38,13 +41,55 @@ except ImportError:
 
 # ── 网络：绕过 macOS 指向未启动 127.0.0.1:7890 的系统代理 ──
 urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
-BASE_URL = (os.environ.get("SENSENOVA_BASE_URL") or "https://token.sensenova.cn/v1").rstrip("/")
+
+# ── 配置：环境变量优先，其次当前目录（或上层）的 .axn.json ──
+# 必须是「图生图 / 图像编辑」模型：接收 images 输入、按提示词改机位。纯文生图模型用不了。
+CONFIG_KEYS = ("api_base", "image_model", "vlm_model", "size", "api_key_env")
+
+
+def load_config():
+    cfg = {}
+    d = os.getcwd()
+    for _ in range(4):
+        p = os.path.join(d, ".axn.json")
+        if os.path.exists(p):
+            try:
+                cfg = json.load(open(p, encoding="utf-8"))
+            except Exception as e:
+                sys.exit("%s 解析失败：%s" % (p, e))
+            break
+        d = os.path.dirname(d)
+    env = {
+        "api_base": os.environ.get("AXN_API_BASE") or os.environ.get("SENSENOVA_BASE_URL"),
+        "image_model": os.environ.get("AXN_IMAGE_MODEL") or os.environ.get("SN_IMAGE_MODEL"),
+        "vlm_model": os.environ.get("AXN_VLM_MODEL") or os.environ.get("SN_VLM_MODEL"),
+        "size": os.environ.get("AXN_SIZE") or os.environ.get("SN_SIZE"),
+    }
+    for k, v in env.items():
+        if v:
+            cfg[k] = v
+    key_env = cfg.get("api_key_env") or "AXN_API_KEY"
+    cfg["api_key"] = (os.environ.get("AXN_API_KEY") or os.environ.get("SENSENOVA_API_KEY")
+                      or os.environ.get(key_env, ""))
+    cfg.setdefault("api_base", "https://token.sensenova.cn/v1")
+    cfg.setdefault("image_model", "sensenova-u1.5-lite")
+    cfg.setdefault("size", "2048x2048")
+    return cfg
+
+
+CFG = load_config()
+BASE_URL = CFG["api_base"].rstrip("/")
 URL = BASE_URL + "/images/edits"
-MODEL = os.environ.get("SN_IMAGE_MODEL") or "sensenova-u1.5-lite"
-SIZE = os.environ.get("SN_SIZE") or "2048x2048"
+MODEL = CFG["image_model"]
+SIZE = CFG["size"]
+VLM = CFG.get("vlm_model") or ""
+API_KEY = CFG["api_key"]
 ATTEMPTS = 3
 TIMEOUT = 300
 STAGGER = 6          # 串行 + 错峰，接口单并发，并发直接 429
+
+NEED_I2I = ("当前模型可能不支持图生图（需要能接受 images 输入的图像编辑模型）。"
+            "用 AXN_IMAGE_MODEL 换一个，或检查 AXN_API_BASE 是否正确：%s" % BASE_URL)
 
 HEAD = """【第一条铁律 · 产品必须与图1完全一致】
 产品是：{identity}。
@@ -131,7 +176,13 @@ def build_prompt(s):
         TAIL.format(allow=s["allow"], tail=s["tail"])
 
 
+def need_key():
+    if not API_KEY:
+        sys.exit("没配置 API Key：export AXN_API_KEY=...（或 .axn.json 里指定 api_key_env）")
+
+
 def request_image(images, prompt, size):
+    need_key()
     payload = {
         "model": MODEL,
         "images": [{"image_url": data_url(p)} for p in images],
@@ -145,7 +196,7 @@ def request_image(images, prompt, size):
     }
     req = urllib.request.Request(
         URL, data=json.dumps(payload).encode(),
-        headers={"Authorization": "Bearer " + os.environ["SENSENOVA_API_KEY"],
+        headers={"Authorization": "Bearer " + API_KEY,
                  "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         return json.loads(r.read().decode())
@@ -181,8 +232,12 @@ def render_one(spec, images, out_path, size):
                 return "ok %.0fs %dKB" % (time.time() - t0, len(img) // 1024)
             last = "no-image: %s" % err
         except urllib.error.HTTPError as e:
-            last = "HTTP %d %s" % (e.code, e.read().decode()[:200])
-            if e.code in (400, 401, 403, 422):
+            body = e.read().decode()[:200]
+            last = "HTTP %d %s" % (e.code, body)
+            if e.code in (400, 404, 422):
+                last += "\n   提示：" + NEED_I2I
+                break
+            if e.code in (401, 403):
                 break
         except Exception as e:
             last = "%s: %s" % (type(e).__name__, e)
@@ -193,6 +248,7 @@ def render_one(spec, images, out_path, size):
 
 def cmd_render(a):
     specs = json.load(open(a.specs, encoding="utf-8"))["skus"]
+    print("端点 %s\n模型 %s（必须是图生图模型）\n尺寸 %s" % (BASE_URL, MODEL, a.size), flush=True)
     cand_dir = a.cand_dir
     os.makedirs(cand_dir, exist_ok=True)
     found = find_sku_dirs(a.src)
@@ -287,17 +343,20 @@ def cmd_clean(a):
 
 
 # ────────────────────────── VLM 辅助：自动起草 specs / 自检 ──────────────────────────
-VLM = os.environ.get("SN_VLM_MODEL") or "sensenova-6.8-flash-lite"
 
 
 def chat(messages, max_tokens=2500, attempts=2):
+    need_key()
+    if not VLM:
+        sys.exit("spec/auto 需要一个视觉模型来起草提示词：export AXN_VLM_MODEL=<看图模型>。"
+                 "不配置也行，手写 _work/specs.json 后直接 render。")
     payload = {"model": VLM, "max_tokens": max_tokens, "messages": messages}
     last = None
     for i in range(attempts):
         try:
             req = urllib.request.Request(
                 BASE_URL + "/chat/completions", data=json.dumps(payload).encode(),
-                headers={"Authorization": "Bearer " + os.environ["SENSENOVA_API_KEY"],
+                headers={"Authorization": "Bearer " + API_KEY,
                          "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=300) as r:
                 data = json.loads(r.read().decode())
@@ -616,7 +675,7 @@ def main():
     p.add_argument("--work", default="_work")
     p.set_defaults(fn=cmd_clean)
 
-    p = sub.add_parser("spec", help="让 VLM 看图起草 specs（可再人工改）")
+    p = sub.add_parser("spec", help="用看图模型起草 specs（可再人工改）")
     p.add_argument("--src", required=True)
     p.add_argument("--specs", default=os.path.join("_work", "specs.json"))
     p.add_argument("--only")
